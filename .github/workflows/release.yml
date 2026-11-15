@@ -1,0 +1,82 @@
+name: Release WordPress plugin
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wordpress-plugin-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out the dispatched commit and tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate the next minor version
+        id: version
+        run: |
+          git tag --list > "$RUNNER_TEMP/release-tags.txt"
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          pattern = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+          tags = Path(os.environ["RUNNER_TEMP"], "release-tags.txt").read_text()
+          versions = [
+              tuple(map(int, match.groups()))
+              for tag in tags.splitlines()
+              if (match := pattern.fullmatch(tag))
+          ]
+          if not versions:
+              raise SystemExit("No stable vMAJOR.MINOR.PATCH tag found. Push a baseline tag and run again.")
+
+          major, minor, _ = max(versions)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"tag=v{major}.{minor + 1}.0", file=output)
+          PY
+
+      - name: Build and verify the plugin ZIP
+        id: package
+        working-directory: src
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if [[ -z "$(find . -type f -print -quit)" ]]; then
+            echo "::error::src must contain at least one file."
+            exit 1
+          fi
+
+          plugin_name="${GITHUB_REPOSITORY##*/}"
+          archive="$RUNNER_TEMP/$plugin_name-$TAG.zip"
+          zip -q -r "$archive" .
+          unzip -tq "$archive"
+          printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Push tag and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          git tag "$TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG:refs/tags/$TAG"
+
+          # Upload the asset to a draft so a failed upload cannot publish an empty release.
+          if ! gh release create "$TAG" "$ARCHIVE" --verify-tag --title "$TAG" --draft --notes "" ||
+             ! gh release edit "$TAG" --draft=false; then
+            echo "::error::Release step failed after pushing $TAG. Check GitHub Releases for $TAG and finish that release with the ZIP from $GITHUB_SHA before dispatching again."
+            exit 1
+          fi
